@@ -1,5 +1,4 @@
 import asyncio
-import json
 from typing import List
 from loguru import logger
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
@@ -106,25 +105,9 @@ class PlanExecuteAgent:
             call_messages.insert(0, SystemMessage(content=PLAN_CALL_TOOL_PROMPT.format(user_query=messages[-1].content, tools_info="\n\n".join([str(tool_schema) for tool_schema in self.plugin_tools_schema + self.mcp_tools_schema]))))
 
         response = structured_response_agent.get_structured_response(call_messages)
-
-        try:
-            content = json.loads(response.content)
-            self.agent_plans = content
-            return content
-        except Exception as err:
-            # Send the error message for parsing model output
-            fix_message = HumanMessage(
-                content=FIX_JSON_PROMPT.format(json_content=response.content, json_error=str(err)))
-            fix_response = await self.conversation_model.ainvoke([fix_message])
-
-            try:
-                fix_content = json.loads(fix_response.content)
-                self.agent_plans = fix_content
-                # Send the completion message for JSON data repair
-                return fix_content
-            except Exception as fix_err:
-                # Send the message for irreparable JSON data
-                raise ValueError(fix_err)
+        content = response.model_dump().get("root", {})
+        self.agent_plans = content
+        return content
 
     async def _execute_agent_actions(self, agent_plans):
         tool_call_model = self.tool_call_model.bind_tools(self.tools + self.mcp_tools)

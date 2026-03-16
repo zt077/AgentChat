@@ -1,159 +1,232 @@
 import time
-from loguru import logger
-from typing import List, Dict, Any, AsyncGenerator, NotRequired, TypedDict, Union, Optional
-from langchain_core.language_models import BaseChatModel
-from langgraph.constants import START, END
-from langgraph.graph import MessagesState, StateGraph
-from langgraph.config import get_stream_writer
-from langchain_core.tools import BaseTool
-from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage, AIMessageChunk, AIMessage, HumanMessage
+from dataclasses import dataclass
+from time import perf_counter
+from typing import Any, AsyncGenerator, Dict, List, NotRequired, Optional, TypedDict, Union
 
+from loguru import logger
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
+from langgraph.config import get_stream_writer
+from langgraph.constants import END, START
+from langgraph.graph import MessagesState, StateGraph
+from langgraph.types import StateSnapshot
+
+from agentchat.api.services.observability import ObservabilityService
 from agentchat.core.callbacks import usage_metadata_callback
 from agentchat.prompts.completion import DEFAULT_CALL_PROMPT
+from agentchat.services.checkpoint import MySQLCheckpointSaver
 
 
-# 定义流式事件的负载结构，增强类型安全性
 class StreamEventData(TypedDict, total=False):
-    """用于 LangGraph 'custom' stream_mode 的事件数据结构"""
     title: str
-    status: str  # e.g., "START", "END", "ERROR"
+    status: str
     message: str
+    run_id: str
+    checkpoint_id: str
+    tool_name: str
 
 
-# 定义流式输出的完整结构
 class StreamOutput(TypedDict):
-    type: str  # e.g., "event", "response_chunk"
+    type: str
     timestamp: float
-    data: Union[StreamEventData, Dict[str, str]]
+    data: Union[StreamEventData, Dict[str, Any]]
 
 
-# 优化的状态类型
 class ReactAgentState(MessagesState):
-    """LangGraph 状态，继承自 MessagesState"""
     tool_call_count: NotRequired[int]
     model_call_count: NotRequired[int]
 
 
-# --- 核心 ReactAgent 类 ---
+@dataclass
+class ToolGovernance:
+    name: str
+    display_name: str
+    tool_type: str = "tool"
+    risk_level: str = "medium"
+    approval_policy: str = "auto"
+    idempotent: bool = True
+    audit_enabled: bool = True
+
 
 class ReactAgent:
-    """
-    一个基于 LangGraph 的 ReAct (Reasoning and Acting) 代理。
-    它支持流式输出，并在工具调用和模型推理过程中发送自定义事件。
-    """
-
-    def __init__(self,
-                 model: BaseChatModel,
-                 system_prompt: Optional[str] = None,
-                 tools: List[BaseTool] = []):
-
+    def __init__(
+        self,
+        model: BaseChatModel,
+        system_prompt: Optional[str] = None,
+        tools: Optional[List[BaseTool]] = None,
+        tool_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        checkpointer: Optional[MySQLCheckpointSaver] = None,
+    ):
         self.model = model
         self.system_prompt = system_prompt
-        self.tools = tools
-        self.mcp_agent_as_tools: List[BaseTool] = []  # 用于集成其他代理作为工具
+        self.tools = tools or []
+        self.tool_metadata_map = tool_metadata_map or {}
+        self.graph = None
+        self.checkpointer = checkpointer or MySQLCheckpointSaver()
 
-        # LangGraph 实例
-        self.graph: Optional[StateGraph] = None
+        self.current_run_id: Optional[str] = None
+        self.current_trace_id: Optional[str] = None
+        self.approved_tools: set[str] = set()
 
-    def _wrap_stream_output(self, type: str, data: Dict[str, Any]) -> StreamOutput:
-        """
-        统一的流式输出包装器。
-        """
+        self.last_response_content = ""
+        self.last_run_status = "idle"
+        self.last_checkpoint_id: Optional[str] = None
+        self.last_paused_tools: list[dict[str, Any]] = []
+
+    def _wrap_stream_output(self, output_type: str, data: Dict[str, Any]) -> StreamOutput:
         return {
-            "type": type,
+            "type": output_type,
             "timestamp": time.time(),
-            "data": data
+            "data": data,
         }
 
     async def _init_agent(self):
-        """延迟初始化 LangGraph，确保在首次调用 astream 时设置好。"""
         if self.graph is None:
             self.graph = await self._setup_react_graph()
 
     def get_tool_by_name(self, tool_name: str) -> Optional[BaseTool]:
-        """根据名称获取工具实例。"""
-        for tool in self.tools + self.mcp_agent_as_tools:
+        for tool in self.tools:
             if tool.name == tool_name:
                 return tool
         return None
 
-    # --- LangGraph Node 定义和 Graph Setup ---
-
-    async def _setup_react_graph(self):
-        """设置 Agent 图，定义节点和边。"""
-
-        workflow = StateGraph(ReactAgentState)
-
-        # 节点定义
-        workflow.add_node("call_tool_node", self._call_tool_node)
-        workflow.add_node("execute_tool_node", self._execute_tool_node)
-
-        # 边和条件边
-        workflow.add_edge(START, "call_tool_node")
-        workflow.add_conditional_edges("call_tool_node", self._should_continue)
-        workflow.add_edge("execute_tool_node", "call_tool_node")  # 工具结果 -> 模型再次推理
-
-        return workflow.compile()
-
-    # --- LangGraph Node Functions ---
-
-    async def _should_continue(self, state: ReactAgentState) -> Union[str, Any]:
-        """条件边：判断是否需要执行工具。"""
-        last_message = state["messages"][-1]
-
-        # 优化：如果模型回复了 content *并且* 没有 tool_calls，也应视为结束。
-        if last_message.tool_calls:
-            return "execute_tool_node"
-
-        return END
-
-    async def _call_tool_node(self, state: ReactAgentState) -> Dict[str, List[BaseMessage]]:
-        """调用模型，判断是否需要工具，并发送工具选择事件。"""
-        stream_writer = get_stream_writer()
-        is_first_call = state.get("tool_call_count", 0) == 0
-
-        # 优化：状态信息和事件消息使用 f-string
-        select_tool_message = (
-            "开始分析和选择可用工具" if is_first_call else
-            f"继续分析是否需要工具（已调用 {state['tool_call_count']} 次）"
+    def get_tool_governance(self, tool_name: str) -> ToolGovernance:
+        metadata = self.tool_metadata_map.get(tool_name, {})
+        return ToolGovernance(
+            name=tool_name,
+            display_name=metadata.get("name", tool_name),
+            tool_type=metadata.get("type", "tool"),
+            risk_level=metadata.get("risk_level", "medium"),
+            approval_policy=metadata.get("approval_policy", "auto"),
+            idempotent=metadata.get("idempotent", True),
+            audit_enabled=metadata.get("audit_enabled", True),
         )
 
-        # 发送工具分析开始事件
-        stream_writer(self._wrap_stream_output("event", {
-            "title": select_tool_message,
-            "status": "START",
-            "message": "正在分析需要使用的工具...",
-        }))
+    def _tool_requires_approval(self, governance: ToolGovernance) -> bool:
+        if governance.approval_policy == "always":
+            return True
+        if governance.approval_policy == "on_high_risk":
+            return governance.risk_level in {"high", "critical"}
+        return False
 
-        tool_invocation_model = self.model.bind_tools(self.tools)
-        response: AIMessage = await tool_invocation_model.ainvoke(state["messages"])
+    def _tool_is_approved(self, governance: ToolGovernance) -> bool:
+        if not self._tool_requires_approval(governance):
+            return True
+        return governance.name in self.approved_tools
 
-        # 判断是否有工具可调用
-        if response.tool_calls:
-            tool_call_names = sorted(list(set(tool_call["name"] for tool_call in response.tool_calls)))
-            # 发送工具选择完成事件
-            stream_writer(self._wrap_stream_output("event", {
+    def _extract_pending_tools(self, snapshot: StateSnapshot) -> list[dict[str, Any]]:
+        values = snapshot.values or {}
+        messages = values.get("messages", [])
+        if not messages:
+            return []
+        last_message = messages[-1]
+        if not isinstance(last_message, AIMessage):
+            return []
+
+        pending_tools = []
+        for tool_call in last_message.tool_calls or []:
+            governance = self.get_tool_governance(tool_call["name"])
+            pending_tools.append(
+                {
+                    "tool_name": tool_call["name"],
+                    "display_name": governance.display_name,
+                    "tool_type": governance.tool_type,
+                    "risk_level": governance.risk_level,
+                    "approval_policy": governance.approval_policy,
+                    "idempotent": governance.idempotent,
+                    "requires_approval": self._tool_requires_approval(governance),
+                    "approved": self._tool_is_approved(governance),
+                    "args": tool_call.get("args", {}),
+                }
+            )
+        return pending_tools
+
+    async def _setup_react_graph(self):
+        workflow = StateGraph(ReactAgentState)
+        workflow.add_node("call_tool_node", self._call_tool_node)
+        workflow.add_node("execute_tool_node", self._execute_tool_node)
+        workflow.add_edge(START, "call_tool_node")
+        workflow.add_conditional_edges("call_tool_node", self._should_continue)
+        workflow.add_edge("execute_tool_node", "call_tool_node")
+        interrupt_before = ["execute_tool_node"] if self.tools else None
+        return workflow.compile(checkpointer=self.checkpointer, interrupt_before=interrupt_before)
+
+    async def _should_continue(self, state: ReactAgentState) -> Union[str, Any]:
+        last_message = state["messages"][-1]
+        if last_message.tool_calls:
+            return "execute_tool_node"
+        return END
+
+    async def _call_tool_node(self, state: ReactAgentState, config: RunnableConfig) -> Dict[str, List[BaseMessage]]:
+        stream_writer = get_stream_writer()
+        is_first_call = state.get("tool_call_count", 0) == 0
+        select_tool_message = (
+            "Select tools for current request"
+            if is_first_call
+            else f"Continue tool selection after {state.get('tool_call_count', 0)} tool rounds"
+        )
+
+        stream_writer(
+            {
                 "title": select_tool_message,
-                "status": "END",
-                "message": f"命中可用工具：{', '.join(tool_call_names)}"
-            }))
+                "status": "START",
+                "message": "Inspecting whether a tool call is needed.",
+                "run_id": self.current_run_id,
+            }
+        )
 
+        started_at = perf_counter()
+        status = "ok"
+        tool_call_count = 0
+        tool_invocation_model = self.model.bind_tools(self.tools) if self.tools else self.model
+        try:
+            response: AIMessage = await tool_invocation_model.ainvoke(
+                state["messages"],
+                config={"callbacks": [usage_metadata_callback]},
+            )
+            tool_call_names = sorted({tool_call["name"] for tool_call in response.tool_calls or []})
+            tool_call_count = len(tool_call_names)
+            stream_writer(
+                {
+                    "title": select_tool_message,
+                    "status": "END",
+                    "message": (
+                        f"Selected tools: {', '.join(tool_call_names)}"
+                        if response.tool_calls
+                        else "Model answered directly without tools."
+                    ),
+                    "run_id": self.current_run_id,
+                }
+            )
             state["messages"].append(response)
             return {"messages": state["messages"]}
-        else:
-            # 发送无工具可用事件
-            stream_writer(self._wrap_stream_output("event", {
-                "title": select_tool_message,
-                "status": "END",
-                "message": "模型选择直接回复，没有命中可用的工具"
-            }))
-
-            # 将模型的最终回复添加到消息中，LangGraph 将通过 END 结束
-            state["messages"].append(response)
-            return {"messages": state["messages"]}
+        except Exception as err:
+            status = "error"
+            stream_writer(
+                {
+                    "title": select_tool_message,
+                    "status": "ERROR",
+                    "message": str(err),
+                    "run_id": self.current_run_id,
+                }
+            )
+            raise
+        finally:
+            if self.current_run_id:
+                await ObservabilityService.record_span(
+                    run_id=self.current_run_id,
+                    trace_id=self.current_trace_id,
+                    span_type="model",
+                    name="main_agent_tool_selection",
+                    started_at=started_at,
+                    status=status,
+                    input_payload={"message_count": len(state["messages"])},
+                    output_payload={"tool_call_count": tool_call_count},
+                )
 
     async def _execute_tool_node(self, state: ReactAgentState) -> Dict[str, Any]:
-        """执行工具，并将结果返回给模型。"""
         stream_writer = get_stream_writer()
         last_message = state["messages"][-1]
         tool_calls = last_message.tool_calls
@@ -161,118 +234,291 @@ class ReactAgent:
 
         if not tool_calls:
             logger.warning("Execute tool node reached without tool calls.")
-            return {"messages": state["messages"], "tool_call_count": state["tool_call_count"]}
+            return {"messages": state["messages"], "tool_call_count": state.get("tool_call_count", 0)}
 
         for tool_call in tool_calls:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
             tool_call_id = tool_call["id"]
+            governance = self.get_tool_governance(tool_name)
+            tool_title = f"Execute {governance.tool_type}: {governance.display_name}"
 
-            tool_title = f"执行工具: {tool_name}"
+            if not self._tool_is_approved(governance):
+                block_message = f"Tool {governance.display_name} requires approval before execution."
+                stream_writer(
+                    {
+                        "status": "PAUSED",
+                        "title": tool_title,
+                        "message": block_message,
+                        "run_id": self.current_run_id,
+                    }
+                )
+                tool_messages.append(ToolMessage(content=block_message, name=tool_name, tool_call_id=tool_call_id))
+                if self.current_run_id and governance.audit_enabled:
+                    await ObservabilityService.record_tool_audit(
+                        run_id=self.current_run_id,
+                        trace_id=self.current_trace_id,
+                        tool_name=tool_name,
+                        tool_type=governance.tool_type,
+                        risk_level=governance.risk_level,
+                        approval_policy=governance.approval_policy,
+                        approved=False,
+                        blocked=True,
+                        idempotent=governance.idempotent,
+                        args_payload=tool_args,
+                        error_message=block_message,
+                    )
+                continue
 
+            started_at = perf_counter()
+            status = "ok"
             try:
-                # 发送工具执行开始事件
-                stream_writer(self._wrap_stream_output("event", {
-                    "status": "START",
-                    "title": tool_title,
-                    "message": f"参数: {tool_args}"
-                }))
-
+                stream_writer(
+                    {
+                        "status": "START",
+                        "title": tool_title,
+                        "message": f"args={tool_args}",
+                        "run_id": self.current_run_id,
+                        "tool_name": tool_name,
+                    }
+                )
                 current_tool = self.get_tool_by_name(tool_name)
-
                 if current_tool is None:
-                    tool_result = f"Error: Tool '{tool_name}' not found."
-                    raise ValueError(tool_result)
+                    raise ValueError(f"Tool '{tool_name}' not found.")
 
-                # 优化：使用 BaseTool 的 ainvoke/invoke 方法
                 if current_tool.coroutine:
                     tool_result = await current_tool.ainvoke(tool_args)
                 else:
                     tool_result = current_tool.invoke(tool_args)
 
-                # 确保结果是字符串，或可转换为字符串
                 tool_result_str = str(tool_result)
-
-                # 发送插件工具执行完成事件
-                stream_writer(self._wrap_stream_output("event", {
-                    "status": "END",
-                    "title": tool_title,
-                    "message": f"结果: {tool_result_str}"
-                }))
-
-                tool_messages.append(
-                    ToolMessage(content=tool_result_str, name=tool_name, tool_call_id=tool_call_id)
+                stream_writer(
+                    {
+                        "status": "END",
+                        "title": tool_title,
+                        "message": f"result={tool_result_str}",
+                        "run_id": self.current_run_id,
+                        "tool_name": tool_name,
+                    }
                 )
-                logger.info(f"Tool {tool_name} executed. Args: {tool_args}, Result: {tool_result_str}")
+                tool_messages.append(ToolMessage(content=tool_result_str, name=tool_name, tool_call_id=tool_call_id))
 
+                if self.current_run_id and governance.audit_enabled:
+                    await ObservabilityService.record_tool_audit(
+                        run_id=self.current_run_id,
+                        trace_id=self.current_trace_id,
+                        tool_name=tool_name,
+                        tool_type=governance.tool_type,
+                        risk_level=governance.risk_level,
+                        approval_policy=governance.approval_policy,
+                        approved=True,
+                        blocked=False,
+                        idempotent=governance.idempotent,
+                        args_payload=tool_args,
+                        result_excerpt=tool_result_str,
+                    )
             except Exception as err:
-                error_message = f"执行工具 {tool_name} 失败: {str(err)}"
-                # 发送插件工具执行错误事件
-                stream_writer(self._wrap_stream_output("event", {
-                    "status": "ERROR",
-                    "title": tool_title,
-                    "message": error_message
-                }))
-
-                logger.error(f"Execute Tool {tool_name} Error: {str(err)}")
-                tool_messages.append(
-                    ToolMessage(content=error_message, name=tool_name, tool_call_id=tool_call_id)
+                status = "error"
+                error_message = f"Tool {tool_name} failed: {err}"
+                stream_writer(
+                    {
+                        "status": "ERROR",
+                        "title": tool_title,
+                        "message": error_message,
+                        "run_id": self.current_run_id,
+                        "tool_name": tool_name,
+                    }
                 )
+                logger.error(error_message)
+                tool_messages.append(ToolMessage(content=error_message, name=tool_name, tool_call_id=tool_call_id))
+                if self.current_run_id and governance.audit_enabled:
+                    await ObservabilityService.record_tool_audit(
+                        run_id=self.current_run_id,
+                        trace_id=self.current_trace_id,
+                        tool_name=tool_name,
+                        tool_type=governance.tool_type,
+                        risk_level=governance.risk_level,
+                        approval_policy=governance.approval_policy,
+                        approved=True,
+                        blocked=False,
+                        idempotent=governance.idempotent,
+                        args_payload=tool_args,
+                        error_message=error_message,
+                    )
+            finally:
+                if self.current_run_id:
+                    await ObservabilityService.record_span(
+                        run_id=self.current_run_id,
+                        trace_id=self.current_trace_id,
+                        span_type="tool",
+                        name=tool_name,
+                        started_at=started_at,
+                        status=status,
+                        input_payload={"args": tool_args},
+                        output_payload={"tool_type": governance.tool_type, "risk_level": governance.risk_level},
+                    )
 
         state["messages"].extend(tool_messages)
-        # 优化：确保 tool_call_count 是整数
-        new_tool_count = state.get("tool_call_count", 0) + 1
+        return {"messages": state["messages"], "tool_call_count": state.get("tool_call_count", 0) + 1}
 
-        return {"messages": state["messages"], "tool_call_count": new_tool_count}
+    async def astream(
+        self,
+        messages: Optional[List[BaseMessage]],
+        *,
+        run_id: str,
+        trace_id: Optional[str] = None,
+        resume: bool = False,
+        approved_tools: Optional[List[str]] = None,
+        dialog_id: Optional[str] = None,
+    ) -> AsyncGenerator[StreamOutput, None]:
+        if not resume:
+            if not messages or not isinstance(messages[-1], (HumanMessage, AIMessage, ToolMessage)):
+                logger.warning("Input messages list is empty or last message type is unexpected.")
+                return
+            if self.system_prompt and not any(isinstance(m, SystemMessage) for m in messages):
+                messages = [SystemMessage(content=self.system_prompt or DEFAULT_CALL_PROMPT), *messages]
 
-    # --- 主调用方法 ---
-
-    async def astream(self, messages: List[BaseMessage]) -> AsyncGenerator[StreamOutput, None]:
-        """流式调用主方法。"""
-
-        # 消息预处理 (System Prompt)
-        if not messages or not isinstance(messages[-1], (HumanMessage, AIMessage, ToolMessage)):
-            # 确保最后一条消息是可交互的消息类型
-            logger.warning("Input messages list is empty or last message type is unexpected.")
-            return
-
-        if self.system_prompt and not any(isinstance(m, SystemMessage) for m in messages):
-            # 优化：如果用户没有提供 SystemMessage，则在最前面插入。
-            system_prompt_msg = self.system_prompt if self.system_prompt else DEFAULT_CALL_PROMPT
-            messages.insert(0, SystemMessage(system_prompt_msg))
-
-        # 初始化 Graph
         await self._init_agent()
 
-        response_content = ""
-        initial_state = {"messages": messages, "tool_call_count": 0, "model_call_count": 0}
+        self.current_run_id = run_id
+        self.current_trace_id = trace_id
+        self.approved_tools = set(approved_tools or [])
+        self.last_response_content = ""
+        self.last_run_status = "running"
+        self.last_paused_tools = []
+
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": run_id,
+                "checkpoint_ns": "main-agent",
+            },
+            "metadata": {
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "dialog_id": dialog_id,
+            },
+            "callbacks": [usage_metadata_callback],
+        }
+
+        current_input: Optional[Dict[str, Any]] = None
+        if not resume:
+            current_input = {
+                "messages": messages,
+                "tool_call_count": 0,
+                "model_call_count": 0,
+            }
 
         try:
-            # 使用 'values' 模式接收整个状态，'custom' 模式接收 stream_writer 事件
-            async for typ, token in self.graph.astream(
-                    input=initial_state,
-                    config={"callbacks": [usage_metadata_callback]},
+            while True:
+                async for stream_type, token in self.graph.astream(
+                    input=current_input,
+                    config=config,
                     stream_mode=["messages", "custom"],
-            ):
-                # 处理自定义事件
-                if typ == "custom":  # LangGraph 的 custom 模式直接返回事件内容
-                    yield self._wrap_stream_output("event", token)
-                # 处理 AIMessageChunk (模型内容流)
-                if typ == "messages" and isinstance(token[0], AIMessageChunk):
-                    response_content += token[0].content
-                    yield self._wrap_stream_output("response_chunk", {
-                        "chunk": token[0].content,
-                        "accumulated": response_content
-                    })
+                ):
+                    if stream_type == "custom":
+                        yield self._wrap_stream_output("event", token)
+                    elif stream_type == "messages" and isinstance(token[0], AIMessageChunk):
+                        if token[0].content:
+                            self.last_response_content += token[0].content
+                            yield self._wrap_stream_output(
+                                "response_chunk",
+                                {
+                                    "chunk": token[0].content,
+                                    "accumulated": self.last_response_content,
+                                    "run_id": run_id,
+                                },
+                            )
 
-        # 兜底错误处理
+                snapshot = await self.graph.aget_state(config)
+                self.last_checkpoint_id = snapshot.config["configurable"].get("checkpoint_id")
+
+                if self.current_run_id:
+                    await ObservabilityService.update_run(
+                        self.current_run_id,
+                        latest_checkpoint_id=self.last_checkpoint_id,
+                    )
+
+                pending_tools = self._extract_pending_tools(snapshot)
+                if "execute_tool_node" in snapshot.next:
+                    if all(item["approved"] for item in pending_tools):
+                        if pending_tools:
+                            yield self._wrap_stream_output(
+                                "event",
+                                {
+                                    "title": "Tool governance",
+                                    "status": "AUTO_APPROVED",
+                                    "message": "Pending tools passed governance checks. Resuming execution.",
+                                    "run_id": run_id,
+                                    "checkpoint_id": self.last_checkpoint_id,
+                                },
+                            )
+                        current_input = None
+                        continue
+
+                    self.last_paused_tools = pending_tools
+                    self.last_run_status = "paused"
+                    if self.current_run_id:
+                        await ObservabilityService.update_run(
+                            self.current_run_id,
+                            status="paused",
+                            latest_checkpoint_id=self.last_checkpoint_id,
+                            paused_tools=pending_tools,
+                        )
+                        for item in pending_tools:
+                            if item["requires_approval"] and not item["approved"]:
+                                await ObservabilityService.record_tool_audit(
+                                    run_id=self.current_run_id,
+                                    trace_id=self.current_trace_id,
+                                    tool_name=item["tool_name"],
+                                    tool_type=item["tool_type"],
+                                    risk_level=item["risk_level"],
+                                    approval_policy=item["approval_policy"],
+                                    approved=False,
+                                    blocked=True,
+                                    idempotent=item["idempotent"],
+                                    args_payload=item["args"],
+                                    error_message="Execution paused pending approval.",
+                                )
+                    yield self._wrap_stream_output(
+                        "approval_required",
+                        {
+                            "title": "Approval required",
+                            "status": "PAUSED",
+                            "message": "Execution paused because one or more tools require approval.",
+                            "run_id": run_id,
+                            "checkpoint_id": self.last_checkpoint_id,
+                            "tools": pending_tools,
+                        },
+                    )
+                    break
+
+                self.last_run_status = "completed"
+                if self.current_run_id:
+                    await ObservabilityService.update_run(
+                        self.current_run_id,
+                        status="completed",
+                        latest_checkpoint_id=self.last_checkpoint_id,
+                    )
+                break
+
         except Exception as err:
-            logger.error(f"Agent Execution Error: {err}")
-
-            # 如果是空回复，则发送错误信息
-            if not response_content:
-                error_chunk = "您的问题可能触发了模型的限制，或执行过程中发生错误。请尝试换个问法。"
-                yield self._wrap_stream_output("response_chunk", {
-                    "chunk": error_chunk,
-                    "accumulated": response_content + error_chunk
-                })
+            self.last_run_status = "failed"
+            logger.error(f"Agent execution error: {err}")
+            if self.current_run_id:
+                await ObservabilityService.update_run(
+                    self.current_run_id,
+                    status="failed",
+                    latest_checkpoint_id=self.last_checkpoint_id,
+                    error_message=str(err),
+                    finish=True,
+                )
+            if not self.last_response_content:
+                error_chunk = "Execution failed. Please retry the request."
+                yield self._wrap_stream_output(
+                    "response_chunk",
+                    {
+                        "chunk": error_chunk,
+                        "accumulated": error_chunk,
+                        "run_id": run_id,
+                    },
+                )

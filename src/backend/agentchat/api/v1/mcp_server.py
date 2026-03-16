@@ -60,6 +60,11 @@ async def create_mcp_server(
             user_name=login_user.user_name,
             description=structured_response.description,
             mcp_as_tool_name=structured_response.mcp_as_tool_name,
+            imported_config=req.imported_config,
+            risk_level=req.risk_level,
+            approval_policy=req.approval_policy,
+            idempotent=req.idempotent,
+            audit_enabled=req.audit_enabled,
         )
         return resp_200()
     except Exception as err:
@@ -167,6 +172,14 @@ async def update_mcp_server(
                 update_data["server_name"] = req.name
             if req.logo_url is not None:
                 update_data["logo_url"] = req.logo_url
+        if req.risk_level is not None:
+            update_data["risk_level"] = req.risk_level
+        if req.approval_policy is not None:
+            update_data["approval_policy"] = req.approval_policy
+        if req.idempotent is not None:
+            update_data["idempotent"] = req.idempotent
+        if req.audit_enabled is not None:
+            update_data["audit_enabled"] = req.audit_enabled
 
         await MCPService.update_mcp_server(
             server_id=req.server_id,

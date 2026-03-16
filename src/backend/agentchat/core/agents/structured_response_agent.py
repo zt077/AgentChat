@@ -1,6 +1,6 @@
-from pydantic import BaseModel
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
+from typing import Any, Sequence
+
+from langchain_core.messages import BaseMessage, HumanMessage
 
 from agentchat.core.callbacks import usage_metadata_callback
 from agentchat.core.models.manager import ModelManager
@@ -9,17 +9,15 @@ from agentchat.core.models.manager import ModelManager
 class StructuredResponseAgent:
     def __init__(self, response_format):
         self.response_format = response_format
-        self.structured_agent = self._create_structured_agent()
-
-    def _create_structured_agent(self):
-        return create_agent(
-            model=ModelManager.get_conversation_model(),
-            response_format=ToolStrategy(self.response_format)
+        self.structured_model = ModelManager.get_conversation_model().with_structured_output(
+            response_format,
+            method="function_calling",
         )
 
-    def get_structured_response(self, messages):
-        result = self.structured_agent.invoke(
-            input={"messages": messages},
-            config={"callbacks": [usage_metadata_callback]}
+    def get_structured_response(self, messages: Sequence[BaseMessage] | str) -> Any:
+        if isinstance(messages, str):
+            messages = [HumanMessage(content=messages)]
+        return self.structured_model.invoke(
+            messages,
+            config={"callbacks": [usage_metadata_callback]},
         )
-        return result["structured_response"]

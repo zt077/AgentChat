@@ -1,4 +1,5 @@
-from typing import List, Any
+from typing import Any, List
+
 from pydantic import BaseModel
 
 
@@ -17,12 +18,14 @@ class LingSeekGuidePromptFeedBack(BaseModel):
     plugins: List[str] = []
     mcp_servers: List[str] = []
 
+
 class LingSeekTask(BaseModel):
     query: str
     guide_prompt: str
     web_search: bool = True
     plugins: List[str] = []
     mcp_servers: List[str] = []
+
 
 class LingSeekTaskStep(BaseModel):
     thought: str
@@ -33,5 +36,8 @@ class LingSeekTaskStep(BaseModel):
     precautions: str
     input_thought: str
     input: List[str] = []
-
     result: str = ""
+
+
+class LingSeekTaskPlan(BaseModel):
+    steps: List[LingSeekTaskStep] = []

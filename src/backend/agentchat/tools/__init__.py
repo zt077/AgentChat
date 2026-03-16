@@ -31,6 +31,7 @@ AgentToolsWithName = {
     "web_search": tavily_search,
     "get_arxiv": get_arxiv,
     "get_weather": get_weather,
+    "get_delivery": get_delivery_info,
     "get_delivery_info": get_delivery_info,
     "text_to_image": text_to_image,
     "image_to_text": image_to_text,

@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from agentchat.api.v1 import (completion, dialog, message, agent, history, mcp_stdio_server, mcp_chat, mars,
                               user, llm, tool, knowledge, knowledge_file, mcp_agent, mcp_server, mcp_user_config,
-                              workspace, lingseek, usage_stats, upload, wechat, agent_skill)
+                              workspace, lingseek, usage_stats, upload, wechat, agent_skill, observability)
 
 router = APIRouter(prefix="/api/v1")
 
@@ -27,3 +27,4 @@ router.include_router(usage_stats.router)
 router.include_router(wechat.router)
 router.include_router(upload.router)
 router.include_router(agent_skill.router)
+router.include_router(observability.router)

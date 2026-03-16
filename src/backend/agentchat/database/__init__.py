@@ -20,6 +20,16 @@ from agentchat.database.models.role import Role
 from agentchat.database.models.workspace_session import WorkSpaceSession
 from agentchat.database.models.usage_stats import UsageStats
 from agentchat.database.models.agent_skill import AgentSkill
+from agentchat.database.models.agent_graph_checkpoint import (
+    AgentGraphCheckpointTable,
+    AgentGraphWriteTable,
+)
+from agentchat.database.models.agent_observability import (
+    AgentEvalRecordTable,
+    AgentRunTable,
+    AgentSpanTable,
+    ToolExecutionAuditTable,
+)
 from agentchat.settings import app_settings
 
 

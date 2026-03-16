@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Any, Dict
 
 import pytz
 
@@ -9,10 +9,10 @@ from agentchat.database.models.user import AdminUser, SystemUser
 
 
 class MCPService:
-
     @classmethod
     async def create_mcp_server(
         cls,
+        *,
         url: str,
         type: str,
         tools: list,
@@ -26,6 +26,10 @@ class MCPService:
         config: dict = None,
         imported_config: dict = None,
         config_enabled: bool = False,
+        risk_level: str = "medium",
+        approval_policy: str = "auto",
+        idempotent: bool = True,
+        audit_enabled: bool = True,
     ):
         return await MCPServerDao.create_mcp_server(
             url=url,
@@ -40,7 +44,11 @@ class MCPService:
             description=description,
             config_enabled=config_enabled,
             logo_url=logo_url,
-            imported_config=imported_config
+            imported_config=imported_config,
+            risk_level=risk_level,
+            approval_policy=approval_policy,
+            idempotent=idempotent,
+            audit_enabled=audit_enabled,
         )
 
     @classmethod
@@ -48,16 +56,10 @@ class MCPService:
         result = await MCPServerDao.get_mcp_server_from_id(mcp_server_id)
         return result.to_dict()
 
-
     @classmethod
     async def update_mcp_server(cls, server_id: str, update_data: dict):
-        if not update_data:
-            return
-
-        return await MCPServerDao.update_mcp_server(
-            mcp_server_id=server_id,
-            update_data=update_data
-        )
+        if update_data:
+            return await MCPServerDao.update_mcp_server(mcp_server_id=server_id, update_data=update_data)
 
     @classmethod
     async def get_server_from_tool_name(cls, tool_name):
@@ -69,17 +71,16 @@ class MCPService:
         return await MCPServerDao.delete_mcp_server(mcp_server_id)
 
     @classmethod
-    async def verify_user_permission(cls, server_id, user_id, action: str="update"):
+    async def verify_user_permission(cls, server_id, user_id, action: str = "update"):
         mcp_server = await MCPServerDao.get_mcp_server_from_id(server_id)
         if mcp_server:
             if user_id not in (mcp_server.user_id, AdminUser):
-                raise ValueError(f"没有权限访问")
+                raise ValueError("No permission to access this MCP server")
         else:
-            raise ValueError(f"服务不存在")
+            raise ValueError("Server not found")
 
     @classmethod
     async def get_all_servers(cls, user_id):
-        # 管理员可看见所有用户的MCP Server
         if user_id in (AdminUser, SystemUser):
             all_servers = await MCPServerDao.get_all_mcp_servers()
         else:
@@ -96,13 +97,8 @@ class MCPService:
     @classmethod
     async def mcp_server_need_update(cls):
         server = await MCPServerDao.get_first_mcp_server()
-
-        # 获取当前时间（使用与数据库相同的时区）
-        current_time = datetime.now(pytz.timezone('Asia/Shanghai'))
-        # 计算时间差
-        time_difference = current_time - server.update_time.replace(tzinfo=pytz.timezone('Asia/Shanghai'))
-
-        # 判断是否超过7天
+        current_time = datetime.now(pytz.timezone("Asia/Shanghai"))
+        time_difference = current_time - server.update_time.replace(tzinfo=pytz.timezone("Asia/Shanghai"))
         return time_difference > timedelta(days=7)
 
     @classmethod
@@ -115,18 +111,22 @@ class MCPService:
             properties = param["input_schema"]["properties"]
             required = param["input_schema"].get("required", [])
             for param_key, param_value in properties.items():
-                tool_schema.append({
-                    "name": param_key,
-                    "description": param_value.get("description", ""),
-                    "type": param_value.get("type"),
-                    "required": True if param_key in required else False
-                })
+                tool_schema.append(
+                    {
+                        "name": param_key,
+                        "description": param_value.get("description", ""),
+                        "type": param_value.get("type"),
+                        "required": param_key in required,
+                    }
+                )
 
-            tools_info.append({
-                "tool_name": param["name"],
-                "tool_description": param.get("description", ""),
-                "tool_schema": tool_schema
-            })
+            tools_info.append(
+                {
+                    "tool_name": param["name"],
+                    "tool_description": param.get("description", ""),
+                    "tool_schema": tool_schema,
+                }
+            )
         return tools_info
 
     @classmethod
@@ -135,44 +135,28 @@ class MCPService:
         mcp_servers.extend(await MCPServerDao.get_mcp_server_ids_from_name(mcp_servers_name, SystemUser))
         return [mcp_server.mcp_server_id for mcp_server in mcp_servers]
 
-
     @classmethod
     def validate_imported_config(cls, payload: Dict[str, Any]):
-        """
-        校验前端传入的 mcpServers 配置
-
-        规则：
-        - 必须包含 mcpServers
-        - mcpServers 必须是 dict
-        - 每个 server 必须包含 type 和 url
-        - headers 可选，但若存在必须是 dict
-        """
         if "mcpServers" not in payload:
-            raise ValueError("缺少字段: mcpServers")
+            raise ValueError("Missing field: mcpServers")
 
         mcp_servers = payload["mcpServers"]
-
         if not isinstance(mcp_servers, dict):
-            raise ValueError("mcpServers 必须是一个字典类型")
-
+            raise ValueError("mcpServers must be a dict")
         if not mcp_servers:
-            raise ValueError("mcpServers 不能为空")
+            raise ValueError("mcpServers cannot be empty")
 
         for server_name, server_conf in mcp_servers.items():
             if not isinstance(server_name, str) or not server_name.strip():
-                raise ValueError(f"非法的 mcpServer 名称: {server_name}")
-
+                raise ValueError(f"Invalid mcpServer name: {server_name}")
             if not isinstance(server_conf, dict):
-                raise ValueError(f"mcpServer `{server_name}` 配置必须是对象")
+                raise ValueError(f"mcpServer `{server_name}` config must be an object")
 
-            # 必填字段
             for required_field in ("type", "url"):
                 if required_field not in server_conf:
-                    raise ValueError(f"mcpServer `{server_name}` 缺少必填字段: {required_field}")
-
+                    raise ValueError(f"mcpServer `{server_name}` missing required field: {required_field}")
                 if not server_conf[required_field]:
-                    raise ValueError(f"mcpServer `{server_name}` 字段 `{required_field}` 不能为空")
+                    raise ValueError(f"mcpServer `{server_name}` field `{required_field}` cannot be empty")
 
-            # headers 可选
             if "headers" in server_conf and not isinstance(server_conf["headers"], dict):
-                raise ValueError(f"mcpServer `{server_name}` 的 headers 必须是对象 (dict)")
+                raise ValueError(f"mcpServer `{server_name}` headers must be a dict")

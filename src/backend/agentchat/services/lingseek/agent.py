@@ -23,7 +23,7 @@ from agentchat.services.mcp.manager import MCPManager
 from agentchat.prompts.lingseek import GenerateGuidePrompt, FeedBackGuidePrompt, GenerateTitlePrompt, \
     GenerateTaskPrompt, FixJsonPrompt, ToolCallPrompt, SystemMessagePrompt
 from agentchat.schema.lingseek import LingSeekGuidePrompt, LingSeekGuidePromptFeedBack, LingSeekTask, \
-    LingSeekTaskStep
+    LingSeekTaskStep, LingSeekTaskPlan
 
 
 class LingSeekAgent:
@@ -65,21 +65,15 @@ class LingSeekAgent:
             yield one
 
     async def _generate_tasks(self, lingseek_task_prompt):
-        conversation_json_model = self.conversation_model.bind(response_format={"type": "json_object"})
-
-        response = await conversation_json_model.ainvoke(input=lingseek_task_prompt, config={"callbacks": [usage_metadata_callback]})
-
-        try:
-            content = json.loads(response.content)
-            return content
-        except Exception as err:
-            fix_message = FixJsonPrompt.format(json_content=response.content, json_error=str(err))
-            fix_response = await conversation_json_model.ainvoke(input=fix_message, config={"callbacks": [usage_metadata_callback]})
-            try:
-                fix_content = json.loads(fix_response.content)
-                return fix_content
-            except Exception as fix_err:
-                raise ValueError(fix_err)
+        structured_model = self.conversation_model.with_structured_output(
+            LingSeekTaskPlan,
+            method="function_calling",
+        )
+        response = await structured_model.ainvoke(
+            lingseek_task_prompt,
+            config={"callbacks": [usage_metadata_callback]},
+        )
+        return response.model_dump()
 
     async def _generate_title(self, query):
         title_prompt = GenerateTitlePrompt.format(query=query)
